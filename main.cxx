@@ -29,6 +29,7 @@
  *   Para Tesseract: 16 - 32 + 24 - 8 + 1 = 1 (fronteira)
  * 
  * Controles: START=ciclar FPS | A=30 | B=60 | C=120 | X=240
+ * Autor: Bruno Monteiro Caldas da Cunha
  */
 
 #include <stdint.h>
