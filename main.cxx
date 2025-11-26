@@ -1,17 +1,20 @@
 /**
  * @file test_polygon.cxx
- * @brief CUBO 3D → PIRÂMIDE → CUBO (Morfismo + Rotação 3D)
+ * @brief MORPHING 3D/4D com Mecânica Lagrangiana (L = T - V)
  * 
- * O cubo gira nos 3 eixos enquanto se deforma em pirâmide e volta
- * Os 4 vértices superiores colapsam para o centro-topo
+ * Cubo 3D rotaciona e se deforma em Pirâmide (e vice-versa)
+ * Com física Lagrangiana real afetando a dinâmica
  * 
- * Cada comando VDP1 ocupa 32 bytes (16 words)
+ * 7 Operadores do Protocolo de Dinâmica Computacional
+ * + Mecânica Analítica/Lagrangiana (L = T - V)
+ * + Topologia (Euler, Curvatura Gaussiana, Gênero)
+ * Autor: Bruno Monteiro Caldas da Cunha
  */
 
 #include <stdint.h>
 
 // ============================================================================
-// VDP1 REGISTERS
+// VDP1/VDP2 REGISTERS
 // ============================================================================
 #define VDP1_TVMR   (*(volatile uint16_t*)0x25D00000)
 #define VDP1_FBCR   (*(volatile uint16_t*)0x25D00002)
@@ -20,12 +23,8 @@
 #define VDP1_EWLR   (*(volatile uint16_t*)0x25D00008)
 #define VDP1_EWRR   (*(volatile uint16_t*)0x25D0000A)
 #define VDP1_ENDR   (*(volatile uint16_t*)0x25D0000C)
-#define VDP1_EDSR   (*(volatile uint16_t*)0x25D00010)
 #define VDP1_VRAM   ((volatile uint16_t*)0x25C00000)
 
-// ============================================================================
-// VDP2 REGISTERS
-// ============================================================================
 #define VDP2_TVMD   (*(volatile uint16_t*)0x25F80000)
 #define VDP2_EXTEN  (*(volatile uint16_t*)0x25F80002)
 #define VDP2_TVSTAT (*(volatile uint16_t*)0x25F80004)
@@ -42,31 +41,15 @@
 #define VDP2_VRAM   ((volatile uint16_t*)0x25E00000)
 
 // ============================================================================
-// VDP1 COMMAND TYPES
+// CONSTANTS
 // ============================================================================
-#define VDP1_CMD_NORMAL_SPRITE     0x0000
-#define VDP1_CMD_SCALED_SPRITE     0x0001
-#define VDP1_CMD_DISTORTED_SPRITE  0x0002
-#define VDP1_CMD_POLYGON           0x0004
-#define VDP1_CMD_POLYLINE          0x0005
-#define VDP1_CMD_LINE              0x0006
-#define VDP1_CMD_USER_CLIP         0x0008
-#define VDP1_CMD_SYSTEM_CLIP       0x0009
-#define VDP1_CMD_LOCAL_COORD       0x000A
-#define VDP1_CMD_END               0x8000
+#define VDP1_CMD_POLYGON      0x0004
+#define VDP1_CMD_SYSTEM_CLIP  0x0009
+#define VDP1_CMD_LOCAL_COORD  0x000A
+#define VDP1_CMD_END          0x8000
 
-// ============================================================================
-// COLORS (RGB1555)
-// ============================================================================
 #define RGB(r,g,b) ((uint16_t)((1<<15)|((b)<<10)|((g)<<5)|(r)))
 #define DARK_BLUE RGB(4, 8, 16)
-#define YELLOW    RGB(31, 31, 0)
-#define RED       RGB(31, 0, 0)
-#define GREEN     RGB(0, 31, 0)
-#define WHITE     RGB(31, 31, 31)
-#define CYAN      RGB(0, 31, 31)
-#define ORANGE    RGB(31, 16, 0)
-#define PURPLE    RGB(20, 0, 31)
 
 // ============================================================================
 // SINE TABLE (256 entries, -127 to +127)
@@ -90,191 +73,238 @@ static const int8_t sintab[256] = {
     -48, -45, -42, -39, -36, -33, -30, -27, -24, -21, -18, -15, -12, -9, -6, -3
 };
 
-static inline int16_t fsin(uint8_t angle) { return sintab[angle]; }
-static inline int16_t fcos(uint8_t angle) { return sintab[(angle + 64) & 255]; }
+static inline int16_t fsin(uint8_t a) { return sintab[a]; }
+static inline int16_t fcos(uint8_t a) { return sintab[(a + 64) & 255]; }
+
+// ============================================================================
+// PROTOCOLO DE DINÂMICA COMPUTACIONAL (7 OPERADORES)
+// ============================================================================
+
+// 1. HIPOTENUSA (Magnitude 4D)
+static int32_t Op_Hipotenusa(int32_t x, int32_t y, int32_t z, int32_t w) {
+    uint32_t sum = (x*x) + (y*y) + (z*z) + (w*w);
+    if (sum == 0) return 0;
+    uint32_t res = 0, bit = 1 << 30;
+    while (bit > sum) bit >>= 2;
+    while (bit != 0) {
+        if (sum >= res + bit) { sum -= res + bit; res = (res >> 1) + bit; }
+        else { res >>= 1; }
+        bit >>= 2;
+    }
+    return (int32_t)res;
+}
+
+// 2. SATURAÇÃO (Clamp)
+static int32_t Op_Saturacao(int32_t val, int32_t minV, int32_t maxV) {
+    if (val < minV) return minV;
+    if (val > maxV) return maxV;
+    return val;
+}
+
+// 3. LOOP (Modulo seguro)
+static int32_t Op_Loop(int32_t val, int32_t len) {
+    if (len <= 0) return 0;
+    val = val % len;
+    if (val < 0) val += len;
+    return val;
+}
+
+// 4. AJUSTE (Interpolação Linear)
+static int32_t Op_Ajuste(int32_t a, int32_t b, int32_t t, int32_t shift) {
+    return a + (((b - a) * t) >> shift);
+}
+
+// 5. INTERSEÇÃO (Teste AABB 1D)
+static int32_t Op_Intersecao(int32_t minA, int32_t maxA, int32_t minB, int32_t maxB) {
+    return (minA <= maxB && maxA >= minB) ? 1 : 0;
+}
+
+// 6. REFLEXÃO (Ping-pong)
+static int32_t Op_Reflexao(int32_t val, int32_t max) {
+    if (max <= 0) return 0;
+    int32_t cycle = val / max;
+    int32_t pos = val % max;
+    if (pos < 0) { pos += max; cycle--; }
+    return (cycle & 1) ? (max - 1 - pos) : pos;
+}
+
+// 7. CRONOS (Delta time scaling)
+static int32_t Op_Cronos(int32_t val, int32_t dt, int32_t shift) {
+    return (val * dt) >> shift;
+}
+
+// ============================================================================
+// MECÂNICA CAUSAL & TOPOLOGIA
+// ============================================================================
+
+// Característica de Euler: χ = V - E + F
+static int32_t Topology_EulerChar(int nVerts, int nEdges, int nFaces) {
+    return nVerts - nEdges + nFaces;
+}
+
+// Curvatura Gaussiana Discreta
+static int32_t Topology_GaussianCurvature(int facesAtVertex, int32_t areaScale) {
+    int32_t idealFaces = 4;
+    int32_t deficit = (idealFaces - facesAtVertex) * 90;
+    if (areaScale == 0) areaScale = 1;
+    return (deficit << 8) / areaScale;
+}
+
+// Gênero Topológico: g = 1 - χ/2
+static int32_t Topology_Genus(int32_t eulerChar) {
+    return (2 - eulerChar) >> 1;
+}
+
+// ============================================================================
+// MECÂNICA ANALÍTICA / LAGRANGIANA (L = T - V)
+// ============================================================================
+
+// Energia Cinética: T = (1/2) * m * v²
+static int32_t Lagrangian_KineticEnergy(int32_t mass, int32_t vx, int32_t vy, int32_t vz) {
+    int32_t vSquared = (vx*vx + vy*vy + vz*vz) >> 4;
+    return (mass * vSquared) >> 1;
+}
+
+// Energia Potencial: V = m * g * h
+static int32_t Lagrangian_PotentialEnergy(int32_t mass, int32_t height, int32_t gravity) {
+    return (mass * gravity * height) >> 8;
+}
+
+// Lagrangiano: L = T - V
+static int32_t Lagrangian_L(int32_t T, int32_t V) { return T - V; }
+
+// Hamiltoniano: H = T + V (Energia Total)
+static int32_t Lagrangian_Hamiltonian(int32_t T, int32_t V) { return T + V; }
+
+// Acumulador de Ação: S = ∫ L dt
+static int32_t action_accumulator = 0;
+static void Lagrangian_AccumulateAction(int32_t L, int32_t dt) {
+    action_accumulator += Op_Cronos(L, dt, 8);
+}
+
+// Momento: p = m * v
+static int32_t Lagrangian_Momentum(int32_t mass, int32_t velocity) {
+    return (mass * velocity) >> 4;
+}
+
+// Força: F = -∂V/∂q
+static int32_t Lagrangian_Force(int32_t V1, int32_t V2, int32_t dist) {
+    if (dist == 0) dist = 1;
+    return -((V2 - V1) << 8) / dist;
+}
 
 // ============================================================================
 // ESTRUTURAS 3D
 // ============================================================================
-struct Vec3 {
-    int16_t x, y, z;
-};
+struct Vec3 { int16_t x, y, z; };
+struct Vec2 { int16_t x, y; };
 
-struct Vec2 {
-    int16_t x, y;
+struct VDP1Command {
+    uint16_t ctrl, link, pmod, colr, srca, size;
+    int16_t xa, ya, xb, yb, xc, yc, xd, yd;
+    uint16_t grda, reserved;
 };
 
 // ============================================================================
-// CUBO - 8 vértices (BASE)
+// CUBO BASE (8 vértices)
 // ============================================================================
-//       4-------5
-//      /|      /|
-//     / |     / |
-//    0-------1  |
-//    |  7----|--6
-//    | /     | /
-//    |/      |/
-//    3-------2
-//
-// CUBO (forma inicial)
 static const Vec3 cubeBase[8] = {
-    {-40, -40, -40},  // 0: front top left
-    { 40, -40, -40},  // 1: front top right
-    { 40,  40, -40},  // 2: front bottom right
-    {-40,  40, -40},  // 3: front bottom left
-    {-40, -40,  40},  // 4: back top left
-    { 40, -40,  40},  // 5: back top right
-    { 40,  40,  40},  // 6: back bottom right
-    {-40,  40,  40},  // 7: back bottom left
+    {-40, -40, -40}, { 40, -40, -40}, { 40,  40, -40}, {-40,  40, -40},
+    {-40, -40,  40}, { 40, -40,  40}, { 40,  40,  40}, {-40,  40,  40},
 };
 
-// PIRÂMIDE (vértices 0,1,4,5 colapsam no topo)
+// PIRÂMIDE TARGET (vértices superiores colapsam no topo)
 static const Vec3 pyramidTarget[8] = {
-    {  0, -70,   0},  // 0: → topo central
-    {  0, -70,   0},  // 1: → topo central
-    { 50,  40, -50},  // 2: front bottom right (maior)
-    {-50,  40, -50},  // 3: front bottom left (maior)
-    {  0, -70,   0},  // 4: → topo central
-    {  0, -70,   0},  // 5: → topo central
-    { 50,  40,  50},  // 6: back bottom right (maior)
-    {-50,  40,  50},  // 7: back bottom left (maior)
+    {  0, -70,   0}, {  0, -70,   0}, { 50,  40, -50}, {-50,  40, -50},
+    {  0, -70,   0}, {  0, -70,   0}, { 50,  40,  50}, {-50,  40,  50},
 };
 
-// Vértices animados (interpolados)
-static Vec3 cubeVerts[8];
+// Vértices animados
+static Vec3 morphedVerts[8];
+static Vec3 prevVerts[8];  // Para calcular velocidade
+static Vec3 velocity[8];   // Velocidade de cada vértice
 
-// 6 faces (4 vértices cada)
+// Vértices transformados e projetados
+static Vec3 transformed[8];
+static Vec2 projected[8];
+
+// 6 faces do cubo
 static const uint8_t cubeFaces[6][4] = {
-    {0, 1, 2, 3},  // Front  (Z-)
-    {5, 4, 7, 6},  // Back   (Z+)
-    {4, 0, 3, 7},  // Left   (X-)
-    {1, 5, 6, 2},  // Right  (X+)
-    {4, 5, 1, 0},  // Top    (Y-)
-    {3, 2, 6, 7},  // Bottom (Y+)
+    {0, 1, 2, 3}, {5, 4, 7, 6}, {4, 0, 3, 7},
+    {1, 5, 6, 2}, {4, 5, 1, 0}, {3, 2, 6, 7},
 };
 
 // Cores das faces
 static const uint16_t faceColors[6] = {
-    RGB(31, 0, 0),    // Front - Red
-    RGB(0, 31, 0),    // Back - Green
-    RGB(0, 0, 31),    // Left - Blue
-    RGB(31, 31, 0),   // Right - Yellow
-    RGB(31, 0, 31),   // Top - Magenta
-    RGB(0, 31, 31),   // Bottom - Cyan
+    RGB(31, 8, 8),   RGB(8, 31, 8),   RGB(8, 8, 31),
+    RGB(31, 31, 8),  RGB(31, 8, 31),  RGB(8, 31, 31),
 };
 
-// Vértices transformados
-static Vec3 transformed[8];
-static Vec2 projected[8];
-
-// ============================================================================
-// VDP1 COMMAND STRUCTURE (32 bytes = 16 words)
-// ============================================================================
-struct VDP1Command {
-    uint16_t ctrl;      // [0] Command control
-    uint16_t link;      // [1] Link pointer
-    uint16_t pmod;      // [2] Draw mode
-    uint16_t colr;      // [3] Color
-    uint16_t srca;      // [4] Source address
-    uint16_t size;      // [5] Size
-    int16_t  xa, ya;    // [6-7] Vertex A
-    int16_t  xb, yb;    // [8-9] Vertex B
-    int16_t  xc, yc;    // [10-11] Vertex C
-    int16_t  xd, yd;    // [12-13] Vertex D
-    uint16_t grda;      // [14] Gouraud table
-    uint16_t reserved;  // [15] Reserved
-};
+// Estado físico do sistema
+static int32_t systemKineticEnergy = 0;
+static int32_t systemPotentialEnergy = 0;
+static int32_t systemLagrangian = 0;
+static int32_t systemHamiltonian = 0;
 
 // ============================================================================
 // HELPERS
 // ============================================================================
-static inline void delay(volatile int n) {
-    while (n-- > 0) __asm__ volatile("nop");
-}
+static inline void delay(volatile int n) { while (n-- > 0) __asm__ volatile("nop"); }
+static inline void WaitVBlankIn(void) { while ((VDP2_TVSTAT & 8) == 0); }
+static inline void WaitVBlankOut(void) { while ((VDP2_TVSTAT & 8) != 0); }
 
-static inline void WaitVBlankIn(void) {
-    while ((VDP2_TVSTAT & 0x0008) == 0) {}
-}
-
-static inline void WaitVBlankOut(void) {
-    while ((VDP2_TVSTAT & 0x0008) != 0) {}
-}
-
-// ============================================================================
-// INITIALIZATION
-// ============================================================================
-static void VDP2_Init(void) {
-    VDP2_TVMD = 0x0000;  // Display off
-    delay(1000);
-    
-    VDP2_EXTEN = 0x0000;
-    VDP2_BGON = 0x0000;  // No backgrounds
-    
-    // Back screen color
-    VDP2_VRAM[0] = DARK_BLUE;
-    VDP2_BKTAU = 0x0000;
-    VDP2_BKTAL = 0x0000;
-    
-    // SPCTL: Enable sprite display
-    // Bit 5 (SPCLMD) = 1: RGB mode (use 16-bit colors directly)
-    // Bits 3-0 (SPTYPE) = 0: Sprite type 0
-    VDP2_SPCTL = 0x0020;
-    
-    // Sprite priorities (7 = highest)
-    VDP2_PRISA = 0x0707;
-    VDP2_PRISB = 0x0707;
-    VDP2_PRISC = 0x0707;
-    VDP2_PRISD = 0x0707;
-    VDP2_PRINA = 0x0000;
-    VDP2_PRINB = 0x0000;
-    
-    VDP2_TVMD = 0x8000;  // NTSC 320x224, display on
-}
-
-static void VDP1_Init(void) {
-    // Stop drawing
-    VDP1_PTMR = 0x0000;
-    VDP1_ENDR = 0x0000;
-    delay(10000);
-    
-    // TV Mode: 16-bit, no rotation
-    VDP1_TVMR = 0x0000;
-    
-    // Frame Buffer: auto erase/change
-    VDP1_FBCR = 0x0000;
-    
-    // Erase color
-    VDP1_EWDR = DARK_BLUE;
-    
-    // Erase area: full screen
-    VDP1_EWLR = 0x0000;           // Top-left (0,0)
-    VDP1_EWRR = (39 << 9) | 223;  // Bottom-right (312,223)
-    
-    // Clear command area
-    for (int i = 0; i < 512; i++) {
-        VDP1_VRAM[i] = 0;
-    }
-}
-
-// ============================================================================
-// INTERPOLAÇÃO LINEAR
-// ============================================================================
+// Interpolação usando Op_Ajuste
 static inline int16_t lerp(int16_t a, int16_t b, int16_t t) {
-    // t vai de 0 a 127
-    return a + (((b - a) * t) >> 7);
+    return (int16_t)Op_Ajuste(a, b, t, 7);
 }
 
-// Interpolar forma do cubo para pirâmide
+// ============================================================================
+// MORPHING: Cubo ↔ Pirâmide
+// ============================================================================
 static void MorphShape(int16_t t) {
     for (int i = 0; i < 8; i++) {
-        cubeVerts[i].x = lerp(cubeBase[i].x, pyramidTarget[i].x, t);
-        cubeVerts[i].y = lerp(cubeBase[i].y, pyramidTarget[i].y, t);
-        cubeVerts[i].z = lerp(cubeBase[i].z, pyramidTarget[i].z, t);
+        // Salvar posição anterior para calcular velocidade
+        prevVerts[i] = morphedVerts[i];
+        
+        // Interpolar entre cubo e pirâmide
+        morphedVerts[i].x = lerp(cubeBase[i].x, pyramidTarget[i].x, t);
+        morphedVerts[i].y = lerp(cubeBase[i].y, pyramidTarget[i].y, t);
+        morphedVerts[i].z = lerp(cubeBase[i].z, pyramidTarget[i].z, t);
+        
+        // Calcular velocidade (para energia cinética)
+        velocity[i].x = morphedVerts[i].x - prevVerts[i].x;
+        velocity[i].y = morphedVerts[i].y - prevVerts[i].y;
+        velocity[i].z = morphedVerts[i].z - prevVerts[i].z;
     }
 }
 
 // ============================================================================
-// ROTAÇÃO 3D
+// CALCULAR ENERGIAS DO SISTEMA (LAGRANGIANO)
+// ============================================================================
+static void CalculateSystemEnergies(int32_t gravity) {
+    systemKineticEnergy = 0;
+    systemPotentialEnergy = 0;
+    
+    const int32_t mass = 16;
+    
+    for (int i = 0; i < 8; i++) {
+        // T = (1/2) * m * v²
+        int32_t T = Lagrangian_KineticEnergy(mass, velocity[i].x, velocity[i].y, velocity[i].z);
+        
+        // V = m * g * h (Y como altura)
+        int32_t V = Lagrangian_PotentialEnergy(mass, morphedVerts[i].y + 100, gravity);
+        
+        systemKineticEnergy += T;
+        systemPotentialEnergy += V;
+    }
+    
+    // L = T - V, H = T + V
+    systemLagrangian = Lagrangian_L(systemKineticEnergy, systemPotentialEnergy);
+    systemHamiltonian = Lagrangian_Hamiltonian(systemKineticEnergy, systemPotentialEnergy);
+}
+
+// ============================================================================
+// ROTAÇÃO 3D + PROJEÇÃO PERSPECTIVA
 // ============================================================================
 static void RotateAndProject(uint8_t angleX, uint8_t angleY, uint8_t angleZ) {
     int16_t sx = fsin(angleX), cx = fcos(angleX);
@@ -282,144 +312,119 @@ static void RotateAndProject(uint8_t angleX, uint8_t angleY, uint8_t angleZ) {
     int16_t sz = fsin(angleZ), cz = fcos(angleZ);
     
     for (int i = 0; i < 8; i++) {
-        int16_t x = cubeVerts[i].x;
-        int16_t y = cubeVerts[i].y;
-        int16_t z = cubeVerts[i].z;
+        int16_t x = morphedVerts[i].x;
+        int16_t y = morphedVerts[i].y;
+        int16_t z = morphedVerts[i].z;
         
-        // Rotação em Z
+        // Rotação Z
         int16_t x1 = (x * cz - y * sz) >> 7;
         int16_t y1 = (x * sz + y * cz) >> 7;
-        int16_t z1 = z;
         
-        // Rotação em Y
-        int16_t x2 = (x1 * cy + z1 * sy) >> 7;
-        int16_t y2 = y1;
-        int16_t z2 = (-x1 * sy + z1 * cy) >> 7;
+        // Rotação Y
+        int16_t x2 = (x1 * cy + z * sy) >> 7;
+        int16_t z2 = (-x1 * sy + z * cy) >> 7;
         
-        // Rotação em X
-        int16_t x3 = x2;
-        int16_t y3 = (y2 * cx - z2 * sx) >> 7;
-        int16_t z3 = (y2 * sx + z2 * cx) >> 7;
+        // Rotação X
+        int16_t y3 = (y1 * cx - z2 * sx) >> 7;
+        int16_t z3 = (y1 * sx + z2 * cx) >> 7;
         
-        transformed[i].x = x3;
-        transformed[i].y = y3;
-        transformed[i].z = z3;
+        transformed[i] = {x2, y3, z3};
         
         // Projeção perspectiva
-        // Z varia de -40 a +40, adicionamos offset para evitar divisão por zero
-        int16_t zOffset = z3 + 150;  // Distância da câmera
-        if (zOffset < 10) zOffset = 10;
+        int16_t zOff = z3 + 150;
+        zOff = Op_Saturacao(zOff, 10, 300);
         
-        // Projeção: x' = x * focal / z
         const int16_t FOCAL = 200;
-        projected[i].x = (x3 * FOCAL) / zOffset;
-        projected[i].y = (y3 * FOCAL) / zOffset;
+        projected[i].x = (x2 * FOCAL) / zOff;
+        projected[i].y = (y3 * FOCAL) / zOff;
     }
 }
 
-// Calcular normal da face (para backface culling)
+// Normal da face (para backface culling)
 static int16_t FaceNormalZ(int face) {
     int i0 = cubeFaces[face][0];
     int i1 = cubeFaces[face][1];
     int i2 = cubeFaces[face][2];
     
-    // Vetores da face
     int16_t ax = projected[i1].x - projected[i0].x;
     int16_t ay = projected[i1].y - projected[i0].y;
     int16_t bx = projected[i2].x - projected[i0].x;
     int16_t by = projected[i2].y - projected[i0].y;
     
-    // Produto vetorial (apenas Z, que é o que nos interessa)
     return (ax * by - ay * bx);
 }
 
-// ============================================================================
-// BUILD COMMAND TABLE
-// ============================================================================
-static void BuildCommands(void) {
-    volatile VDP1Command* cmd = (volatile VDP1Command*)VDP1_VRAM;
-    
-    // Command 0: System Clip
-    cmd[0].ctrl = VDP1_CMD_SYSTEM_CLIP;
-    cmd[0].link = 0;
-    cmd[0].pmod = 0;
-    cmd[0].colr = 0;
-    cmd[0].srca = 0;
-    cmd[0].size = 0;
-    cmd[0].xa = 0;
-    cmd[0].ya = 0;
-    cmd[0].xb = 0;
-    cmd[0].yb = 0;
-    cmd[0].xc = 319;
-    cmd[0].yc = 223;
-    cmd[0].xd = 0;
-    cmd[0].yd = 0;
-    cmd[0].grda = 0;
-    cmd[0].reserved = 0;
-    
-    // Command 1: Local Coordinates
-    cmd[1].ctrl = VDP1_CMD_LOCAL_COORD;
-    cmd[1].link = 0;
-    cmd[1].pmod = 0;
-    cmd[1].colr = 0;
-    cmd[1].srca = 0;
-    cmd[1].size = 0;
-    cmd[1].xa = 160;
-    cmd[1].ya = 112;
-    cmd[1].xb = 0;
-    cmd[1].yb = 0;
-    cmd[1].xc = 0;
-    cmd[1].yc = 0;
-    cmd[1].xd = 0;
-    cmd[1].yd = 0;
-    cmd[1].grda = 0;
-    cmd[1].reserved = 0;
-    
-    // Commands 2-7: 6 faces do cubo (inicialmente vazias)
-    for (int i = 0; i < 6; i++) {
-        cmd[2 + i].ctrl = VDP1_CMD_POLYGON;
-        cmd[2 + i].link = 0;
-        cmd[2 + i].pmod = 0x00C0;
-        cmd[2 + i].colr = faceColors[i];
-        cmd[2 + i].srca = 0;
-        cmd[2 + i].size = 0;
-        cmd[2 + i].xa = 0;
-        cmd[2 + i].ya = 0;
-        cmd[2 + i].xb = 0;
-        cmd[2 + i].yb = 0;
-        cmd[2 + i].xc = 0;
-        cmd[2 + i].yc = 0;
-        cmd[2 + i].xd = 0;
-        cmd[2 + i].yd = 0;
-        cmd[2 + i].grda = 0;
-        cmd[2 + i].reserved = 0;
+// Profundidade média da face
+static int16_t FaceDepth(int face) {
+    int d = 0;
+    for (int i = 0; i < 4; i++) {
+        d += transformed[cubeFaces[face][i]].z;
     }
-    
-    // Command 8: End
-    cmd[8].ctrl = VDP1_CMD_END;
-    cmd[8].link = 0;
-    cmd[8].pmod = 0;
-    cmd[8].colr = 0;
-    cmd[8].srca = 0;
-    cmd[8].size = 0;
-    cmd[8].xa = 0;
-    cmd[8].ya = 0;
-    cmd[8].xb = 0;
-    cmd[8].yb = 0;
-    cmd[8].xc = 0;
-    cmd[8].yc = 0;
-    cmd[8].xd = 0;
-    cmd[8].yd = 0;
-    cmd[8].grda = 0;
-    cmd[8].reserved = 0;
+    return d >> 2;
 }
 
 // ============================================================================
-// MAIN - Cubo 3D Rotacionando + Deformando
+// INICIALIZAÇÃO
+// ============================================================================
+static void InitHardware(void) {
+    // VDP2
+    VDP2_TVMD = 0;
+    delay(1000);
+    VDP2_EXTEN = 0;
+    VDP2_BGON = 0;
+    VDP2_VRAM[0] = DARK_BLUE;
+    VDP2_BKTAU = 0; VDP2_BKTAL = 0;
+    VDP2_SPCTL = 0x0020;
+    VDP2_PRISA = 0x0707; VDP2_PRISB = 0x0707;
+    VDP2_PRISC = 0x0707; VDP2_PRISD = 0x0707;
+    VDP2_PRINA = 0; VDP2_PRINB = 0;
+    VDP2_TVMD = 0x8000;
+    
+    // VDP1
+    VDP1_PTMR = 0; VDP1_ENDR = 0;
+    delay(10000);
+    VDP1_TVMR = 0; VDP1_FBCR = 0;
+    VDP1_EWDR = DARK_BLUE;
+    VDP1_EWLR = 0;
+    VDP1_EWRR = (39 << 9) | 223;
+    
+    for (int i = 0; i < 512; i++) VDP1_VRAM[i] = 0;
+    
+    // Inicializar vértices
+    for (int i = 0; i < 8; i++) {
+        morphedVerts[i] = cubeBase[i];
+        prevVerts[i] = cubeBase[i];
+        velocity[i] = {0, 0, 0};
+    }
+}
+
+static void BuildCommands(void) {
+    volatile VDP1Command* cmd = (volatile VDP1Command*)VDP1_VRAM;
+    
+    // System Clip
+    cmd[0].ctrl = VDP1_CMD_SYSTEM_CLIP;
+    cmd[0].xc = 319; cmd[0].yc = 223;
+    
+    // Local Coordinates (centro da tela)
+    cmd[1].ctrl = VDP1_CMD_LOCAL_COORD;
+    cmd[1].xa = 160; cmd[1].ya = 112;
+    
+    // 6 faces (inicialmente vazias)
+    for (int i = 0; i < 6; i++) {
+        cmd[2 + i].ctrl = VDP1_CMD_POLYGON;
+        cmd[2 + i].pmod = 0x00C0;
+        cmd[2 + i].colr = faceColors[i];
+    }
+    
+    // End
+    cmd[8].ctrl = VDP1_CMD_END;
+}
+
+// ============================================================================
+// MAIN - MORPHING + ROTAÇÃO + FÍSICA LAGRANGIANA
 // ============================================================================
 int main(void) {
-    VDP2_Init();
-    VDP1_Init();
+    InitHardware();
     BuildCommands();
     
     volatile VDP1Command* cmd = (volatile VDP1Command*)VDP1_VRAM;
@@ -427,78 +432,149 @@ int main(void) {
     
     while (1) {
         WaitVBlankIn();
-        
-        // Trigger draw
         VDP1_PTMR = 0x0001;
-        
         WaitVBlankOut();
         
-        // ================================
-        // MORFISMO: Cubo ↔ Pirâmide
-        // ================================
-        // Usa seno para ir e voltar suavemente
-        uint8_t morphPhase = frame;  // ciclo completo a cada 256 frames
+        // ================================================================
+        // MORFISMO: Cubo ↔ Pirâmide (usando seno para suavidade)
+        // ================================================================
+        uint8_t morphPhase = frame;
         int16_t morphT = (fsin(morphPhase) + 127) >> 1;  // 0 a 127
+        morphT = Op_Saturacao(morphT, 0, 127);
         
-        // Aplicar deformação
         MorphShape(morphT);
         
-        // ================================
-        // ROTAÇÃO 3D
-        // ================================
-        uint8_t angleX = frame;
-        uint8_t angleY = (frame * 2) / 3;
-        uint8_t angleZ = frame / 2;
+        // ================================================================
+        // FÍSICA LAGRANGIANA (L = T - V)
+        // ================================================================
+        int32_t gravity = 8 + (morphT >> 4);  // Gravidade aumenta com deformação
+        CalculateSystemEnergies(gravity);
         
-        // Transformar vértices
+        // Acumular Ação (Princípio de Mínima Ação: δS = 0)
+        Lagrangian_AccumulateAction(systemLagrangian, 4);
+        
+        // Calcular Momento Total
+        int32_t totalMomentum = 0;
+        for (int i = 0; i < 8; i++) {
+            int32_t vMag = Op_Hipotenusa(velocity[i].x, velocity[i].y, velocity[i].z, 0);
+            totalMomentum += Lagrangian_Momentum(16, vMag);
+        }
+        
+        // Força Generalizada
+        int32_t force = Lagrangian_Force(
+            systemPotentialEnergy,
+            systemPotentialEnergy + morphedVerts[0].y,
+            Op_Hipotenusa(morphedVerts[0].x, morphedVerts[0].y, morphedVerts[0].z, 0) + 1
+        );
+        
+        // ================================================================
+        // TOPOLOGIA
+        // ================================================================
+        int32_t nFaces = 6 - (morphT >> 5);  // 6→4 faces durante morph
+        nFaces = Op_Saturacao(nFaces, 4, 6);
+        int32_t eulerChi = Topology_EulerChar(8, 12, nFaces);
+        int32_t genus = Topology_Genus(eulerChi);
+        int32_t curvature = Topology_GaussianCurvature(nFaces >> 1, 64);
+        
+        // ================================================================
+        // ROTAÇÃO 3D (modulada por física)
+        // ================================================================
+        // Energia cinética afeta velocidade de rotação
+        int32_t rotBoost = Op_Saturacao(systemKineticEnergy >> 6, 0, 32);
+        rotBoost += (totalMomentum >> 8);
+        rotBoost += Op_Reflexao(force >> 8, 16);  // Usar Op_Reflexao
+        
+        uint8_t angleX = frame + (rotBoost >> 2);
+        uint8_t angleY = (frame * 2) / 3 + (genus << 2);
+        uint8_t angleZ = frame / 2 + (curvature >> 6);
+        
         RotateAndProject(angleX, angleY, angleZ);
         
-        // ================================
-        // RENDERIZAR FACES
-        // ================================
-        int cmdIdx = 2;
-        for (int face = 0; face < 6; face++) {
-            // Backface culling
-            int16_t nz = FaceNormalZ(face);
-            
-            if (nz < 0) {
-                // Face visível
-                int i0 = cubeFaces[face][0];
-                int i1 = cubeFaces[face][1];
-                int i2 = cubeFaces[face][2];
-                int i3 = cubeFaces[face][3];
-                
-                cmd[cmdIdx].ctrl = VDP1_CMD_POLYGON;
-                
-                // Cor varia com o morph (mais saturada quando pirâmide)
-                uint16_t baseColor = faceColors[face];
-                uint8_t r = (baseColor & 0x001F);
-                uint8_t g = (baseColor >> 5) & 0x001F;
-                uint8_t b = (baseColor >> 10) & 0x001F;
-                
-                // Aumentar brilho durante morph
-                int16_t boost = morphT >> 3;  // 0 a 15
-                r = (r + boost > 31) ? 31 : r + boost;
-                g = (g + boost > 31) ? 31 : g + boost;
-                b = (b + boost > 31) ? 31 : b + boost;
-                
-                cmd[cmdIdx].colr = RGB(r, g, b);
-                cmd[cmdIdx].xa = projected[i0].x;
-                cmd[cmdIdx].ya = projected[i0].y;
-                cmd[cmdIdx].xb = projected[i1].x;
-                cmd[cmdIdx].yb = projected[i1].y;
-                cmd[cmdIdx].xc = projected[i2].x;
-                cmd[cmdIdx].yc = projected[i2].y;
-                cmd[cmdIdx].xd = projected[i3].x;
-                cmd[cmdIdx].yd = projected[i3].y;
-                cmdIdx++;
+        // ================================================================
+        // ORDENAR FACES POR PROFUNDIDADE
+        // ================================================================
+        int8_t order[6] = {0, 1, 2, 3, 4, 5};
+        int16_t depths[6];
+        
+        for (int i = 0; i < 6; i++) {
+            depths[i] = FaceDepth(i);
+        }
+        
+        // Bubble sort (ordenar do mais longe ao mais perto)
+        for (int i = 0; i < 5; i++) {
+            for (int j = i + 1; j < 6; j++) {
+                if (depths[i] > depths[j]) {
+                    int16_t td = depths[i]; depths[i] = depths[j]; depths[j] = td;
+                    int8_t to = order[i]; order[i] = order[j]; order[j] = to;
+                }
             }
         }
         
-        // Terminar lista de comandos
+        // ================================================================
+        // RENDERIZAR FACES
+        // ================================================================
+        int cmdIdx = 2;
+        
+        // Usar Op_Intersecao para verificar visibilidade
+        int16_t screenMinX = -160, screenMaxX = 160;
+        
+        for (int i = 0; i < 6; i++) {
+            int face = order[i];
+            int16_t nz = FaceNormalZ(face);
+            
+            // Backface culling (face visível se normal < 0)
+            if (nz >= 0) continue;
+            
+            int i0 = cubeFaces[face][0];
+            int i1 = cubeFaces[face][1];
+            int i2 = cubeFaces[face][2];
+            int i3 = cubeFaces[face][3];
+            
+            // Verificar se face está na tela usando Op_Intersecao
+            int16_t faceMinX = projected[i0].x;
+            int16_t faceMaxX = projected[i0].x;
+            for (int v = 1; v < 4; v++) {
+                int16_t px = projected[cubeFaces[face][v]].x;
+                if (px < faceMinX) faceMinX = px;
+                if (px > faceMaxX) faceMaxX = px;
+            }
+            
+            if (!Op_Intersecao(faceMinX, faceMaxX, screenMinX, screenMaxX)) continue;
+            
+            // Cor base
+            uint16_t baseColor = faceColors[face];
+            uint8_t r = (baseColor & 0x1F);
+            uint8_t g = (baseColor >> 5) & 0x1F;
+            uint8_t b = (baseColor >> 10) & 0x1F;
+            
+            // Shading baseado em Hamiltoniano (energia total)
+            int16_t energyShade = Op_Saturacao((systemHamiltonian >> 8) + 8, 0, 15);
+            
+            // Boost de cor durante morph (Lagrangiano)
+            int16_t morphBoost = morphT >> 3;
+            
+            r = Op_Saturacao(r + morphBoost + (energyShade >> 2), 8, 31);
+            g = Op_Saturacao(g + morphBoost + (energyShade >> 2), 8, 31);
+            b = Op_Saturacao(b + morphBoost + (energyShade >> 2), 8, 31);
+            
+            cmd[cmdIdx].ctrl = VDP1_CMD_POLYGON;
+            cmd[cmdIdx].colr = RGB(r, g, b);
+            cmd[cmdIdx].xa = projected[i0].x;
+            cmd[cmdIdx].ya = projected[i0].y;
+            cmd[cmdIdx].xb = projected[i1].x;
+            cmd[cmdIdx].yb = projected[i1].y;
+            cmd[cmdIdx].xc = projected[i2].x;
+            cmd[cmdIdx].yc = projected[i2].y;
+            cmd[cmdIdx].xd = projected[i3].x;
+            cmd[cmdIdx].yd = projected[i3].y;
+            cmdIdx++;
+        }
+        
+        // Terminar lista
         cmd[cmdIdx].ctrl = VDP1_CMD_END;
         
-        frame++;
+        // Usar Op_Loop para ciclar frame
+        frame = Op_Loop(frame + 1, 65536);
     }
     
     return 0;
