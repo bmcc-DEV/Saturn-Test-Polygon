@@ -134,7 +134,7 @@ static int32_t Op_Cronos(int32_t val, int32_t dt, int32_t shift) {
 }
 
 // ============================================================================
-// MECÂNICA CAUSAL & TOPOLOGIA
+// TOPOLOGIA
 // ============================================================================
 
 // Característica de Euler: χ = V - E + F
